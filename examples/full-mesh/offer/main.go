@@ -17,12 +17,27 @@ import (
 
 var (
 	waitingСonnection bool = false
+	connectionCount        = 0
+)
+
+var (
+	sendingMessage string = "START"
+	sendingCount   int    = 0
 )
 
 type peerConnectionState struct {
 	peerConnection *webrtc.PeerConnection
 	candidatesMux  sync.Mutex
 	listenAddr     string
+}
+
+func getMessage() string {
+	sendingCount++
+	if sendingCount > connectionCount {
+		sendingCount = 1
+		sendingMessage = signal.RandSeq(15)
+	}
+	return sendingMessage
 }
 
 func handshake(addr string, listen_addr string) ([]string, error) {
@@ -76,7 +91,7 @@ func createDataChannel(offerAddr string, peerConnection *webrtc.PeerConnection) 
 		fmt.Printf("Data channel '%s'-'%d' open. Random messages will now be sent to any connected DataChannels every 5 seconds\n", dataChannel.Label(), dataChannel.ID())
 
 		for range time.NewTicker(5 * time.Second).C {
-			message := signal.RandSeq(15)
+			message := getMessage()
 			fmt.Printf("Sending '%s'\n", message)
 
 			// Send the message as text
@@ -127,7 +142,7 @@ func waitDataChannel(peerConnection *webrtc.PeerConnection) {
 			fmt.Printf("Data channel '%s'-'%d' open. Random messages will now be sent to any connected DataChannels every 5 seconds\n", d.Label(), d.ID())
 
 			for range time.NewTicker(5 * time.Second).C {
-				message := signal.RandSeq(15)
+				message := getMessage()
 				fmt.Printf("Sending '%s'\n", message)
 
 				// Send the message as text
@@ -165,6 +180,7 @@ func handshakeHandler(offerAddr string, peerConnections *[]peerConnectionState) 
 	}
 
 	*peerConnections = append(*peerConnections, peerConnectionState{peerConnection, candidatesMux, offerAddr})
+	connectionCount++
 
 	// When an ICE candidate is available send to the other Pion instance
 	// the other Pion instance will add this candidate by calling AddICECandidate
