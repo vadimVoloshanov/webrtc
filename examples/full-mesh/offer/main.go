@@ -8,11 +8,24 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/pion/interceptor"
+	"github.com/pion/mediadevices"
+	"github.com/pion/mediadevices/pkg/codec/opus"
+	"github.com/pion/mediadevices/pkg/codec/vpx"
+	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v3"
 	"github.com/pion/webrtc/v3/examples/internal/signal"
+	"github.com/pion/webrtc/v3/pkg/media"
+	"github.com/pion/webrtc/v3/pkg/media/ivfwriter"
+	"github.com/pion/webrtc/v3/pkg/media/oggwriter"
+
+	_ "github.com/pion/mediadevices/pkg/driver/camera"     // This is required to register camera adapter
+	_ "github.com/pion/mediadevices/pkg/driver/microphone" // This is required to register microphone adapter
 )
 
 var (
@@ -160,6 +173,24 @@ func waitDataChannel(peerConnection *webrtc.PeerConnection) {
 	})
 }
 
+func saveToDisk(i media.Writer, track *webrtc.TrackRemote) {
+	defer func() {
+		if err := i.Close(); err != nil {
+			panic(err)
+		}
+	}()
+
+	for {
+		rtpPacket, _, err := track.ReadRTP()
+		if err != nil {
+			panic(err)
+		}
+		if err := i.WriteRTP(rtpPacket); err != nil {
+			panic(err)
+		}
+	}
+}
+
 func handshakeHandler(offerAddr string, peerConnections *[]peerConnectionState) {
 	var candidatesMux sync.Mutex
 	pendingCandidates := make([]*webrtc.ICECandidate, 0)
@@ -173,8 +204,39 @@ func handshakeHandler(offerAddr string, peerConnections *[]peerConnectionState) 
 		},
 	}
 
+	x264Params, err := vpx.NewVP8Params()
+	if err != nil {
+		panic(err)
+	}
+	x264Params.BitRate = 1_000_000 // 500kbps
+	x264Params.KeyFrameInterval = 30
+
+	opusParams, err := opus.NewParams()
+	if err != nil {
+		panic(err)
+	}
+	codecSelector := mediadevices.NewCodecSelector(
+		mediadevices.WithVideoEncoders(&x264Params),
+		mediadevices.WithAudioEncoders(&opusParams),
+	)
+	mediaEngine := &webrtc.MediaEngine{}
+	codecSelector.Populate(mediaEngine)
+	// api := webrtc.NewAPI(webrtc.WithMediaEngine(mediaEngine))
+
+	////////////////////////////////////////////////////////
+	i := &interceptor.Registry{}
+
+	// Use the default set of Interceptors
+	if err := webrtc.RegisterDefaultInterceptors(mediaEngine, i); err != nil {
+		panic(err)
+	}
+
+	// Create the API object with the MediaEngine
+	api := webrtc.NewAPI(webrtc.WithMediaEngine(mediaEngine), webrtc.WithInterceptorRegistry(i))
+	////////////////////////////////////////////////////////
+
 	// Create a new RTCPeerConnection
-	peerConnection, err := webrtc.NewPeerConnection(config)
+	peerConnection, err := api.NewPeerConnection(config)
 	if err != nil {
 		panic(err)
 	}
@@ -200,10 +262,115 @@ func handshakeHandler(offerAddr string, peerConnections *[]peerConnectionState) 
 		}
 	})
 
+	oggFile, err := oggwriter.New("output.ogg", 48000, 2)
+	if err != nil {
+		panic(err)
+	}
+	h264File, err := ivfwriter.New("output.ivf")
+	if err != nil {
+		panic(err)
+	}
+
 	// Set the handler for ICE connection state
 	// This will notify you when the peer has connected/disconnected
 	peerConnection.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
 		fmt.Printf("ICE Connection State has changed: %s\n", connectionState.String())
+
+		if connectionState == webrtc.ICEConnectionStateFailed || connectionState == webrtc.ICEConnectionStateDisconnected {
+			closeErr := oggFile.Close()
+			if closeErr != nil {
+				panic(closeErr)
+			}
+
+			closeErr = h264File.Close()
+			if closeErr != nil {
+				panic(closeErr)
+			}
+
+			fmt.Println("Done writing media files")
+			os.Exit(0)
+		}
+	})
+
+	// s, err := mediadevices.GetUserMedia(mediadevices.MediaStreamConstraints{
+	// 	Video: func(c *mediadevices.MediaTrackConstraints) {
+	// 		c.FrameFormat = prop.FrameFormat(frame.FormatI420)
+	// 		c.Width = prop.Int(640)
+	// 		c.Height = prop.Int(480)
+	// 	},
+	// 	Audio: func(c *mediadevices.MediaTrackConstraints) {
+	// 	},
+	// 	Codec: codecSelector,
+	// })
+	// if err != nil {
+	// 	panic(err)
+	// }
+
+	// for _, track := range s.GetTracks() {
+	// 	track.OnEnded(func(err error) {
+	// 		fmt.Printf("Track (ID: %s) ended with error: %v\n",
+	// 			track.ID(), err)
+	// 	})
+
+	// 	fmt.Println("Add Tranceive from Track")
+	// 	_, err = peerConnection.AddTransceiverFromTrack(track,
+	// 		webrtc.RtpTransceiverInit{
+	// 			Direction: webrtc.RTPTransceiverDirectionSendrecv,
+	// 		},
+	// 	)
+	// 	if err != nil {
+	// 		panic(err)
+	// 	}
+	// }
+
+	// // Allow us to receive 1 video track
+	// if _, err = peerConnection.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo); err != nil {
+	// 	panic(err)
+	// }
+
+	// Allow us to receive 1 audio track, and 1 video track
+	if _, err = peerConnection.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio); err != nil {
+		panic(err)
+	} else if _, err = peerConnection.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo); err != nil {
+		panic(err)
+	}
+
+	// localTrackChan := make(chan *webrtc.TrackLocalStaticRTP)
+
+	peerConnection.OnTrack(func(t *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
+		fmt.Println("OnTrack START")
+		// Create a track to fan out our incoming video to all peers
+		// trackLocal := addTrack(t)
+		// defer removeTrack(trackLocal)
+
+		// Send a PLI on an interval so that the publisher is pushing a keyframe every rtcpPLIInterval
+		go func() {
+			ticker := time.NewTicker(time.Second * 1)
+			for range ticker.C {
+				errSend := peerConnection.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: uint32(t.SSRC())}})
+				if errSend != nil {
+					fmt.Println(errSend)
+				}
+			}
+		}()
+		codec := t.Codec()
+		if strings.EqualFold(codec.MimeType, webrtc.MimeTypeOpus) {
+			fmt.Println("Got Opus track, saving to disk as output.opus (48 kHz, 2 channels)")
+			saveToDisk(oggFile, t)
+		} else if strings.EqualFold(codec.MimeType, webrtc.MimeTypeVP8) {
+			fmt.Println("Got VP8 track, saving to disk as output.ivf")
+			saveToDisk(h264File, t)
+		}
+
+		// buf := make([]byte, 1500)
+		// for {
+		// 	i, _, err := t.Read(buf)
+		// 	if err != nil {
+		// 		return
+		// 	}
+
+		// 	fmt.Println(buf[:i])
+		// }
 	})
 
 	if waitingСonnection {
@@ -214,6 +381,7 @@ func handshakeHandler(offerAddr string, peerConnections *[]peerConnectionState) 
 }
 
 func main() { //nolint:gocognit
+	fmt.Println("Initialise drivers finish")
 	offerAddr := flag.String("offer-address", "127.0.0.1:50000", "Address that the Offer HTTP server is hosted on.")
 	answerAddr := flag.String("answer-address", "127.0.0.1:60000", "Address that the Answer HTTP server is hosted on.")
 	flag.Parse()

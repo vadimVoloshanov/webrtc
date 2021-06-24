@@ -10,8 +10,16 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pion/mediadevices"
+	"github.com/pion/mediadevices/pkg/codec/opus"
+	"github.com/pion/mediadevices/pkg/codec/vpx"
+	"github.com/pion/mediadevices/pkg/frame"
+	"github.com/pion/mediadevices/pkg/prop"
 	"github.com/pion/webrtc/v3"
 	"github.com/pion/webrtc/v3/examples/internal/signal"
+
+	_ "github.com/pion/mediadevices/pkg/driver/camera"     // This is required to register camera adapter
+	_ "github.com/pion/mediadevices/pkg/driver/microphone" // This is required to register microphone adapter
 )
 
 var (
@@ -54,6 +62,7 @@ func signalCandidate(addr string, c *webrtc.ICECandidate) error {
 }
 
 func handshakeHandler(offerAddr string, peerConnections *[]peerConnectionState) {
+	fmt.Println("handshakeHandler START")
 	var candidatesMux sync.Mutex
 	pendingCandidates := make([]*webrtc.ICECandidate, 0)
 
@@ -67,7 +76,27 @@ func handshakeHandler(offerAddr string, peerConnections *[]peerConnectionState) 
 	}
 
 	// Create a new RTCPeerConnection
-	peerConnection, err := webrtc.NewPeerConnection(config)
+	x264Params, err := vpx.NewVP8Params()
+	if err != nil {
+		panic(err)
+	}
+	x264Params.BitRate = 1_000_000 // 500kbps
+	x264Params.KeyFrameInterval = 30
+
+	opusParams, err := opus.NewParams()
+	if err != nil {
+		panic(err)
+	}
+	codecSelector := mediadevices.NewCodecSelector(
+		mediadevices.WithVideoEncoders(&x264Params),
+		mediadevices.WithAudioEncoders(&opusParams),
+	)
+	mediaEngine := webrtc.MediaEngine{}
+	codecSelector.Populate(&mediaEngine)
+	api := webrtc.NewAPI(webrtc.WithMediaEngine(&mediaEngine))
+
+	// Create a new RTCPeerConnection
+	peerConnection, err := api.NewPeerConnection(config)
 	if err != nil {
 		panic(err)
 	}
@@ -99,6 +128,61 @@ func handshakeHandler(offerAddr string, peerConnections *[]peerConnectionState) 
 		fmt.Printf("ICE Connection State has changed: %s\n", connectionState.String())
 	})
 
+	s, err := mediadevices.GetUserMedia(mediadevices.MediaStreamConstraints{
+		Video: func(c *mediadevices.MediaTrackConstraints) {
+			c.FrameFormat = prop.FrameFormat(frame.FormatI420)
+			c.Width = prop.Int(640)
+			c.Height = prop.Int(480)
+		},
+		Audio: func(c *mediadevices.MediaTrackConstraints) {
+		},
+		Codec: codecSelector,
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	for _, track := range s.GetTracks() {
+		track.OnEnded(func(err error) {
+			fmt.Printf("Track (ID: %s) ended with error: %v\n",
+				track.ID(), err)
+		})
+
+		fmt.Println("Add Tranceive from Track")
+		_, err = peerConnection.AddTransceiverFromTrack(track,
+			webrtc.RtpTransceiverInit{
+				Direction: webrtc.RTPTransceiverDirectionSendrecv,
+			},
+		)
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	// Allow us to receive 1 audio track, and 1 video track
+	if _, err = peerConnection.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio); err != nil {
+		panic(err)
+	} else if _, err = peerConnection.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo); err != nil {
+		panic(err)
+	}
+
+	fmt.Println("Init OnTrack")
+	peerConnection.OnTrack(func(t *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
+		// Create a track to fan out our incoming video to all peers
+		// trackLocal := addTrack(t)
+		// defer removeTrack(trackLocal)
+
+		buf := make([]byte, 1500)
+		for {
+			i, _, err := t.Read(buf)
+			if err != nil {
+				return
+			}
+
+			fmt.Println(buf[:i])
+		}
+	})
+
 	// Register data channel creation handling
 	peerConnection.OnDataChannel(func(d *webrtc.DataChannel) {
 		fmt.Printf("New DataChannel %s %d\n", d.Label(), d.ID())
@@ -124,9 +208,12 @@ func handshakeHandler(offerAddr string, peerConnections *[]peerConnectionState) 
 			fmt.Printf("Message from DataChannel '%s': '%s'\n", d.Label(), string(msg.Data))
 		})
 	})
+
+	fmt.Println("handshakeHandler END")
 }
 
 func main() { // nolint:gocognit
+	fmt.Println("Initialise drivers finish")
 	answerAddr := flag.String("answer-address", "127.0.0.1:60000", "Address that the Answer HTTP server is hosted on.")
 	flag.Parse()
 
